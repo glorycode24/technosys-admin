@@ -4,6 +4,7 @@ import { supabaseAdmin } from "@/lib/supabase/admin"
 import { createClient } from "@/lib/supabase/server"
 import { verifyRoleAccess, UserRole } from "@/lib/permissions"
 import { getBranchFilter } from "@/lib/branch-filter"
+import { WORK_V2, loadWorkV2 } from "@/lib/dtrWorkV2"
 
 export interface DailyAuditRecord {
   date: string; // 'YYYY-MM-DD'
@@ -19,6 +20,8 @@ export interface DailyAuditRecord {
   grossHours: number;
   hoursWorked: number; // net of 1h lunch if gross > 5h
   lateMinutes: number;
+  /** Hours past 8 with no approved overtime request (not counted as overtime). */
+  unapprovedOtHours?: number;
   regOtHours: number;
   sunHolidayOtHours: number;
   nightDiffHours: number;
@@ -48,7 +51,6 @@ export interface EmployeeAuditSummary {
   role: 'technician' | 'helper';
   level: string;
   status: string;
-  base_salary: number;
   branch_id?: string | null;
   daysWorked: number;
   totalHours: number;
@@ -62,7 +64,7 @@ export interface EmployeeAuditSummary {
   dailyBreakdown: DailyAuditRecord[];
 }
 
-export interface AuditPayrollResult {
+export interface DtrResult {
   success: boolean;
   periodLabel: string;
   startDate: string;
@@ -148,11 +150,21 @@ function getDatesInRange(startDateStr: string, endDateStr: string): string[] {
   return dates;
 }
 
-export async function getAuditPayrollRecords(
+// Technocycle's DTR rules (confirmed by Andrew, 15 Nov 2026):
+// - The regular shift starts at 8:00 AM; a job's own start time is used on job days.
+// - 15-minute grace period: late only after 8:15 (or the job time + 15), counted from the start time.
+// - Monday to Saturday are workdays; Sunday is the rest day.
+// - Overtime counts only up to the hours HR approved in an overtime request for that day.
+const SHIFT_START = '08:00'
+const GRACE_MINUTES = 15
+
+type DtrJob = { id: string; technician_id: string | null; client_name: string; location: string; start_time: string; end_time: string | null; status: string | null }
+
+export async function getDtrRecords(
   startDate: string,
   endDate: string,
   roleFilter: 'all' | 'technician' | 'helper' = 'all'
-): Promise<AuditPayrollResult> {
+): Promise<DtrResult> {
   try {
     const { authorized } = await verifyRoleAccess('attendance', false);
     if (!authorized) {
@@ -175,7 +187,7 @@ export async function getAuditPayrollRecords(
     // 2. Fetch Profiles (technicians and helpers)
     let profileQuery = supabaseAdmin
       .from('profiles')
-      .select('id, full_name, role, technician_level, employment_status, base_salary, branch_id')
+      .select('id, full_name, role, technician_level, employment_status, branch_id, hire_date')
       .in('role', roleFilter === 'all' ? ['technician', 'helper'] : [roleFilter])
       .order('full_name');
 
@@ -199,7 +211,7 @@ export async function getAuditPayrollRecords(
 
     // 3. Batch Fetch Time Logs for the period
     const { data: timeLogs, error: logsErr } = await supabaseAdmin
-      .from('time_logs')
+      .from('attendance_logs')
       .select('id, technician_id, app_time_in, app_time_out, total_hours, status, is_manual_entry, is_mocked, gps_accuracy, is_suspicious')
       .in('technician_id', profileIds)
       .gte('app_time_in', utcStart)
@@ -220,10 +232,40 @@ export async function getAuditPayrollRecords(
 
     if (schedErr) throw schedErr;
 
+    // 4b. Jobs where they are crew (not lead): their start time and absences follow those jobs too.
+    const { data: crewRows, error: crewErr } = await supabaseAdmin
+      .from('schedule_crew')
+      .select('technician_id, schedules!inner(id, technician_id, client_name, location, start_time, end_time, status)')
+      .in('technician_id', profileIds)
+      .neq('status', 'released')
+      .gte('schedules.start_time', utcStart)
+      .lte('schedules.start_time', utcEnd)
+      .neq('schedules.status', 'cancelled');
+    if (crewErr) throw crewErr;
+    let allJobs: DtrJob[] = [
+      ...((schedules || []) as DtrJob[]),
+      ...(crewRows || []).map((r) => ({ ...(r.schedules as unknown as DtrJob), technician_id: r.technician_id })),
+    ];
+    // Work v2 (after the switch-over): work days and jobs from the new tables, hours from the database
+    const v2 = WORK_V2 ? await loadWorkV2(profileIds, startDate, endDate) : null;
+    if (v2) allJobs = v2.jobs as unknown as DtrJob[];
+    const dtrLogs = v2 ? v2.logs : (timeLogs || []);
+
+    // 4c. Approved overtime (hours past 8 count as overtime only up to these).
+    const { data: otRequests, error: otErr } = await supabaseAdmin
+      .from('overtime_requests')
+      .select('technician_id, request_date, requested_hours')
+      .in('technician_id', profileIds)
+      .gte('request_date', startDate)
+      .lte('request_date', endDate)
+      .eq('status', 'approved');
+    if (otErr) throw otErr;
+    const todayStr = getManilaDateString(new Date());
+
     // 5. Batch Fetch Holidays
     const { data: holidays, error: holErr } = await supabaseAdmin
       .from('holidays')
-      .select('id, name, holiday_date, multiplier, is_active')
+      .select('id, name, holiday_date, is_active')
       .gte('holiday_date', startDate)
       .lte('holiday_date', endDate)
       .eq('is_active', true);
@@ -243,7 +285,7 @@ export async function getAuditPayrollRecords(
 
     // 7. Batch Fetch DTR Corrections in Range
     const { data: corrections } = await supabaseAdmin
-      .from('time_log_corrections')
+      .from('attendance_corrections')
       .select('id, time_log_id, technician_id, target_date, reason, actor_role, created_at')
       .in('technician_id', profileIds)
       .gte('target_date', startDate)
@@ -251,17 +293,21 @@ export async function getAuditPayrollRecords(
       .order('created_at', { ascending: false });
 
     // Create lookup maps for fast access
-    const holidayMap = new Map<string, { name: string; multiplier: number }>();
+    const holidayMap = new Map<string, { name: string }>();
     (holidays || []).forEach(h => {
-      holidayMap.set(h.holiday_date, { name: h.name, multiplier: Number(h.multiplier || 1.0) });
+      holidayMap.set(h.holiday_date, { name: h.name });
     });
 
     const datesList = getDatesInRange(startDate, endDate);
 
     // 8. Aggregate metrics per employee
     const aggregatedSummaries: EmployeeAuditSummary[] = profiles.map(profile => {
-      const empLogs = (timeLogs || []).filter(l => l.technician_id === profile.id);
-      const empScheds = (schedules || []).filter(s => s.technician_id === profile.id);
+      const empLogs = dtrLogs.filter(l => l.technician_id === profile.id);
+      const empScheds = allJobs
+        .filter((s, i, all) => s.technician_id === profile.id && all.findIndex((o) => o.id === s.id && o.technician_id === s.technician_id) === i)
+        .sort((a, b) => a.start_time.localeCompare(b.start_time));
+      const approvedOtOn = (day: string) =>
+        (otRequests || []).filter((o) => o.technician_id === profile.id && o.request_date === day).reduce((sum, o) => sum + Number(o.requested_hours || 0), 0);
       const empLeaves = (leaves || []).filter(lv => lv.technician_id === profile.id);
       const empCorrections = (corrections || []).filter(c => c.technician_id === profile.id);
 
@@ -283,6 +329,8 @@ export async function getAuditPayrollRecords(
         const isSunday = dayDate.getDay() === 0;
         const holiday = holidayMap.get(dateStr);
         const isHoliday = !!holiday;
+        // Days before someone was hired are never absences
+        const counts = dateStr < todayStr && !(profile.hire_date && dateStr < profile.hire_date);
 
         // Matching Schedule on this date (in Manila time)
         const sched = empScheds.find(s => {
@@ -363,7 +411,8 @@ export async function getAuditPayrollRecords(
 
           // Compute gross & net hours (deduct 1h unpaid meal break if shift > 5h)
           const grossHours = Math.max(0, (outDate.getTime() - inDate.getTime()) / (1000 * 60 * 60));
-          const netHours = grossHours > 5 ? Math.max(0, grossHours - 1) : grossHours;
+          // Work v2: the database already counted from the start time, to the end time + approved overtime
+          const netHours = v2 && log.total_hours != null ? Number(log.total_hours) : grossHours > 5 ? Math.max(0, grossHours - 1) : grossHours;
           totalHours += netHours;
 
           // Late Calculation:
@@ -373,25 +422,29 @@ export async function getAuditPayrollRecords(
           if (sched) {
             expectedStartTimeMs = new Date(sched.start_time).getTime();
           } else {
-            const defStart = new Date(`${dateStr}T09:00:00+08:00`);
+            const defStart = new Date(`${dateStr}T${SHIFT_START}:00+08:00`);
             expectedStartTimeMs = defStart.getTime();
           }
 
+          // Late only past the grace period; the minutes count from the start time.
           let dayLateMins = 0;
-          if (inDate.getTime() > expectedStartTimeMs) {
-            dayLateMins = Math.floor((inDate.getTime() - expectedStartTimeMs) / (1000 * 60));
-            if (dayLateMins > 0) {
-              lateCount += 1;
-              totalLateMinutes += dayLateMins;
-            }
+          const minutesAfterStart = Math.floor((inDate.getTime() - expectedStartTimeMs) / (1000 * 60));
+          if (minutesAfterStart > GRACE_MINUTES) {
+            dayLateMins = minutesAfterStart;
+            lateCount += 1;
+            totalLateMinutes += dayLateMins;
           }
 
           // Overtime & Night Diff:
-          const dayNdHours = calculateNightDiffHours(inDate, outDate);
+          // Work v2: night hours only inside the counted window (start time → end time + approved overtime), like the hours
+          const ndIn = v2 && sched ? new Date(Math.max(inDate.getTime(), new Date(sched.start_time).getTime())) : inDate;
+          const ndOut = v2 && sched?.end_time ? new Date(Math.min(outDate.getTime(), new Date(sched.end_time).getTime() + approvedOtOn(dateStr) * 3600000)) : outDate;
+          const dayNdHours = calculateNightDiffHours(ndIn, ndOut);
           nightDiffHours += dayNdHours;
 
           let dayRegOt = 0;
           let daySunHolOt = 0;
+          let unapprovedExtra = 0;
 
           if (isHoliday || isSunday) {
             // Entire work is Sunday / Holiday OT
@@ -400,7 +453,8 @@ export async function getAuditPayrollRecords(
           } else {
             // Regular workday: hours beyond 8 hours count as Reg OT
             if (netHours > 8) {
-              dayRegOt = netHours - 8;
+              dayRegOt = Math.min(netHours - 8, approvedOtOn(dateStr));
+              unapprovedExtra = netHours - 8 - dayRegOt;
               regOtHours += dayRegOt;
             }
           }
@@ -428,6 +482,7 @@ export async function getAuditPayrollRecords(
             lateMinutes: dayLateMins,
             regOtHours: parseFloat(dayRegOt.toFixed(1)),
             sunHolidayOtHours: parseFloat(daySunHolOt.toFixed(1)),
+            unapprovedOtHours: parseFloat(unapprovedExtra.toFixed(1)),
             nightDiffHours: parseFloat(dayNdHours.toFixed(1)),
             isSunday,
             isHoliday,
@@ -439,12 +494,16 @@ export async function getAuditPayrollRecords(
             isSuspicious: !!log.is_suspicious,
             hasLeaveCollision: !!(log && leave),
             leaveType: leave?.leave_type || null,
-            notes: (log && leave) ? `Attended work on approved ${leave.leave_type || 'paid'} leave` : undefined,
+            notes: [
+              log && leave ? `Attended work on approved ${leave.leave_type || 'paid'} leave` : null,
+              unapprovedExtra >= 0.1 ? `${unapprovedExtra.toFixed(1)} h past 8 hours without an approved overtime request` : null,
+            ].filter(Boolean).join('. ') || undefined,
             isCorrected,
             correctionDetails,
           });
 
-        } else if (leave) {
+        } else if (leave && !isSunday && !isHoliday) {
+          // A leave only uses up workdays: a Sunday or holiday inside it stays a rest day or holiday.
           approvedLeaves += 1;
           dailyBreakdown.push({
             date: dateStr,
@@ -465,7 +524,7 @@ export async function getAuditPayrollRecords(
             nightDiffHours: 0,
             isSunday,
             isHoliday,
-            holidayName: holiday?.name,
+            holidayName: null,
             status: 'approved_leave',
             leaveType: leave.leave_type,
             notes: `Official ${leave.leave_type.toUpperCase()} leave`,
@@ -474,8 +533,8 @@ export async function getAuditPayrollRecords(
             correctionDetails,
           });
 
-        } else if (sched) {
-          // Employee had a scheduled shift but did not clock in
+        } else if (sched && counts) {
+          // Employee had a job but did not time in
           absences += 1;
           dailyBreakdown.push({
             date: dateStr,
@@ -558,8 +617,36 @@ export async function getAuditPayrollRecords(
             correctionDetails,
           });
 
+        } else if (counts) {
+          // A Monday–Saturday workday that has passed, with no time-in, no leave and no holiday.
+          absences += 1;
+          dailyBreakdown.push({
+            date: dateStr,
+            dayOfWeek,
+            timeLogId: null,
+            rawTimeIn: null,
+            rawTimeOut: null,
+            scheduledStart: null,
+            scheduledEnd: null,
+            actualTimeIn: null,
+            actualTimeOut: null,
+            grossHours: 0,
+            hoursWorked: 0,
+            lateMinutes: 0,
+            regOtHours: 0,
+            sunHolidayOtHours: 0,
+            nightDiffHours: 0,
+            isSunday: false,
+            isHoliday: false,
+            status: 'absent',
+            notes: 'No time-in on a workday',
+            isManualEntry: false,
+            isCorrected,
+            correctionDetails,
+          });
+
         } else {
-          // Unscheduled weekday without attendance (Standby / Off-Duty)
+          // Today (not over yet) or a day still to come: not counted.
           dailyBreakdown.push({
             date: dateStr,
             dayOfWeek,
@@ -579,7 +666,7 @@ export async function getAuditPayrollRecords(
             isSunday: false,
             isHoliday: false,
             status: 'off_duty',
-            notes: 'No dispatch assigned',
+            notes: dateStr === todayStr ? 'No time-in yet today' : dateStr < todayStr ? 'Before hire date' : 'Upcoming day',
             isManualEntry: false,
             isCorrected,
             correctionDetails,
@@ -593,7 +680,6 @@ export async function getAuditPayrollRecords(
         role: profile.role as 'technician' | 'helper',
         level: profile.technician_level || (profile.role === 'helper' ? 'Helper' : 'Technician'),
         status: profile.employment_status || 'regular',
-        base_salary: Number(profile.base_salary || 0),
         branch_id: profile.branch_id,
         daysWorked,
         totalHours: parseFloat(totalHours.toFixed(1)),
@@ -616,14 +702,14 @@ export async function getAuditPayrollRecords(
       records: aggregatedSummaries,
     };
   } catch (err: any) {
-    console.error('getAuditPayrollRecords error:', err);
+    console.error('getDtrRecords error:', err);
     return {
       success: false,
       periodLabel: '',
       startDate,
       endDate,
       records: [],
-      error: err.message || 'Failed to aggregate audit payroll records',
+      error: err.message || 'Failed to load DTR records',
     };
   }
 }

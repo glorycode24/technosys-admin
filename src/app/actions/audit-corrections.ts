@@ -4,6 +4,8 @@ import { supabaseAdmin } from "@/lib/supabase/admin"
 import { createClient } from "@/lib/supabase/server"
 import { revalidatePath } from "next/cache"
 import { logActivity } from "./activity"
+import { WORK_V2 } from "@/lib/dtrWorkV2"
+import { correctWorkDay } from "@/lib/correctWorkDay"
 
 export interface CorrectPunchInput {
   timeLogId?: string | null
@@ -49,7 +51,7 @@ async function getAuthorizedActor() {
     throw new Error("Unable to resolve authenticated user profile.")
   }
 
-  const allowedRoles = ['accountant', 'hr', 'ceo', 'super_admin']
+  const allowedRoles = ['hr', 'ceo', 'coordinator']
   if (!allowedRoles.includes(profile.role)) {
     throw new Error(`Forbidden. Role '${profile.role}' is not authorized to execute DTR audit corrections.`)
   }
@@ -86,6 +88,9 @@ export async function correctTimeLogPunch(
       return { success: false, error: "Clock-out timestamp must be chronologically after clock-in timestamp." }
     }
 
+    // Work v2: the database corrects the work day and counts late and hours by the same rules as the phone
+    if (WORK_V2) return await correctWorkDay(input, inDate, outDate, trimmedReason)
+
     // 2. DOLE Net Hours calculation (deduct 1h unpaid meal break if shift > 5 hours)
     const grossHours = (outDate.getTime() - inDate.getTime()) / (1000 * 60 * 60)
     const netHours = grossHours > 5 ? Math.max(0, grossHours - 1) : grossHours
@@ -98,7 +103,7 @@ export async function correctTimeLogPunch(
     // 3. Update existing time log or insert new shift
     if (effectiveTimeLogId) {
       const { data: existingLog, error: fetchErr } = await supabaseAdmin
-        .from('time_logs')
+        .from('attendance_logs')
         .select('*')
         .eq('id', effectiveTimeLogId)
         .single()
@@ -111,7 +116,7 @@ export async function correctTimeLogPunch(
       originalTimeOut = existingLog.app_time_out
 
       const { error: updateErr } = await supabaseAdmin
-        .from('time_logs')
+        .from('attendance_logs')
         .update({
           app_time_in: inDate.toISOString(),
           app_time_out: outDate.toISOString(),
@@ -127,7 +132,7 @@ export async function correctTimeLogPunch(
       correctionType = 'insert_missing_shift'
 
       const { data: newLog, error: insertErr } = await supabaseAdmin
-        .from('time_logs')
+        .from('attendance_logs')
         .insert({
           technician_id: input.technicianId,
           app_time_in: inDate.toISOString(),
@@ -147,7 +152,7 @@ export async function correctTimeLogPunch(
 
     // 4. Record Immutable Audit Correction in public.time_log_corrections
     const { error: correctionErr } = await supabaseAdmin
-      .from('time_log_corrections')
+      .from('attendance_corrections')
       .insert({
         time_log_id: effectiveTimeLogId,
         technician_id: input.technicianId,
@@ -186,7 +191,8 @@ export async function correctTimeLogPunch(
     }
 
     // 6. Path Revalidation
-    revalidatePath('/accountant')
+    revalidatePath('/hr/audit')
+    revalidatePath('/coordinator/audit')
     revalidatePath('/hr')
     revalidatePath('/hr/audit')
 
@@ -209,7 +215,7 @@ export async function getTimeLogCorrectionHistory(
     await getAuthorizedActor()
 
     let query = supabaseAdmin
-      .from('time_log_corrections')
+      .from('attendance_corrections')
       .select(`
         id,
         time_log_id,
@@ -224,7 +230,7 @@ export async function getTimeLogCorrectionHistory(
         corrected_by,
         actor_role,
         created_at,
-        profiles!time_log_corrections_corrected_by_fkey (
+        profiles!attendance_corrections_corrected_by_fkey (
           full_name
         )
       `)

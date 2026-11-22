@@ -3,75 +3,44 @@
 import { createClient } from '@/lib/supabase/server'
 import { redirect } from 'next/navigation'
 
+// Each person signs in with a username; the login email is <username>@technocycle.ph.
+// (Demo accounts: ceo / ceo, hr / hr, coordinator / coordinator.)
+const DOMAIN = 'technocycle.ph'
+
+const HOME_BY_ROLE: Record<string, string> = {
+  ceo: '/ceo',
+  hr: '/hr',
+  coordinator: '/coordinator',
+  technician: '/technician',
+  helper: '/technician',
+}
+
 export async function login(formData: FormData) {
-  const email = formData.get('email') as string
-  const password = formData.get('password') as string
-  const roleOverride = formData.get('role_override') as string
+  const identifier = String(formData.get('username') || formData.get('email') || '').trim().toLowerCase()
+  const password = String(formData.get('password') || '')
+
+  if (!identifier || !password) {
+    return redirect('/login?message=Please enter your username and password')
+  }
+
+  const email = identifier.includes('@') ? identifier : `${identifier.replace(/\s+/g, '.')}@${DOMAIN}`
   const supabase = await createClient()
 
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email,
-    password,
-  })
-
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password })
   if (error || !data.user) {
-    return redirect('/login?message=Could not authenticate user')
+    return redirect('/login?message=Invalid username or password')
   }
 
-  let finalRoute = '/coordinator'; // Global system fallback
-
-  if (roleOverride !== 'auto') {
-    finalRoute = roleOverride;
-  } else {
-    // Attempt DB lookup if they selected Auto
-    const { data: roleData } = await supabase
-      .from('roles') // Assuming standard 'roles' table exists
-      .select('default_dashboard_route')
-      .eq('user_id', data.user.id)
-      .single();
-      
-    if (roleData?.default_dashboard_route) {
-      finalRoute = roleData.default_dashboard_route;
-    }
+  const { data: profile } = await supabase.from('profiles').select('role, lifecycle_status').eq('id', data.user.id).single()
+  if (!profile || !['active', 'on_leave'].includes(profile.lifecycle_status)) {
+    await supabase.auth.signOut()
+    return redirect('/login?message=This account is not active. Please contact HR.')
   }
 
-  // Inject into session metadata for the Edge Proxy to read during routing
-  await supabase.auth.updateUser({
-    data: { default_dashboard_route: finalRoute }
-  });
+  const home = HOME_BY_ROLE[profile.role] || '/technician'
 
-  return redirect('/')
-}
-export async function sendOtp(formData: FormData) {
-  const phone = formData.get('phone') as string
-  const supabase = await createClient()
+  // The proxy reads these to send each role to its own dashboard.
+  await supabase.auth.updateUser({ data: { role: profile.role, default_dashboard_route: home } })
 
-  const { error } = await supabase.auth.signInWithOtp({
-    phone: +63 + phone,
-  })
-
-  if (error) {
-    return { error: error.message }
-  }
-
-  return { success: true }
-}
-
-export async function verifyOtpAction(formData: FormData) {
-  const phone = formData.get('phone') as string
-  const otp = formData.get('otp') as string
-  const next = formData.get('next') as string
-  const supabase = await createClient()
-
-  const { data, error } = await supabase.auth.verifyOtp({
-    phone: +63 + phone,
-    token: otp,
-    type: 'sms',
-  })
-
-  if (error || !data.user) {
-    return redirect('/login?message=Invalid OTP Code&next=' + next)
-  }
-
-  return redirect(next || '/technician')
+  return redirect(home)
 }

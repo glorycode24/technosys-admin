@@ -2,12 +2,20 @@
 import { supabaseAdmin } from "@/lib/supabase/admin"
 import { revalidatePath } from "next/cache"
 import { logActivity } from "./activity"
+import { verifyRoleAccess } from "@/lib/permissions"
+
+/** Office staff only. write = lending, returns and tool edits. */
+async function canUseInventory(write = false) {
+  return (await verifyRoleAccess('inventory', write)).authorized
+}
+const NOT_ALLOWED = "Only office staff can manage tools."
 
 // 1. Fetch all inventory items (Tools Catalog)
 export async function getInventoryItems() {
   try {
+    if (!(await canUseInventory())) return []
     const { data, error } = await supabaseAdmin
-      .from('tool_catalog')
+      .from('tools')
       .select('*')
       .order('name', { ascending: true })
 
@@ -22,16 +30,15 @@ export async function getInventoryItems() {
 // 2. Create or update a tool item (Coordinator Encoder)
 export async function createOrUpdateInventoryItem(formData: FormData) {
   try {
+    if (!(await canUseInventory(true))) return { error: NOT_ALLOWED }
     const id = formData.get("id")?.toString()
     const name = formData.get("name")?.toString().trim()
     const description = formData.get("description")?.toString().trim() || ""
     const category = formData.get("category")?.toString().trim() || "General Tools"
     const serial_number = formData.get("serial_number")?.toString().trim() || null
-    const unit_cost = Number(formData.get("unit_cost")) || 0
     const is_serialized = formData.get("is_serialized") === "true"
     const item_status = formData.get("status")?.toString() || "active"
     const total_stock = Number(formData.get("total_stock"))
-    const available_stock = Number(formData.get("available_stock"))
     const image_url = formData.get("image_url")?.toString() || null
     const imageFile = formData.get("image") as File | null
 
@@ -39,13 +46,20 @@ export async function createOrUpdateInventoryItem(formData: FormData) {
       return { error: "Tool Name is required." }
     }
 
-    if (isNaN(total_stock) || isNaN(available_stock) || total_stock < 0 || available_stock < 0) {
-      return { error: "Quantities must be non-negative numbers." }
+    if (!Number.isInteger(total_stock) || total_stock < 0) {
+      return { error: "Total owned must be a whole number, 0 or more." }
     }
 
-    if (available_stock > total_stock) {
-      return { error: "Available quantity cannot exceed total quantity in inventory." }
+    // In the warehouse = total owned minus what's lent out now (never typed in, so it can't drift)
+    let lentOut = 0
+    if (id) {
+      const { data: out, error: outErr } = await supabaseAdmin
+        .from('tool_borrowings').select('quantity').eq('tool_id', id).eq('status', 'checked_out')
+      if (outErr) throw outErr
+      lentOut = (out ?? []).reduce((sum, b) => sum + (b.quantity ?? 1), 0)
+      if (total_stock < lentOut) return { error: `Lent out right now: ${lentOut}. The total can't be less than that.` }
     }
+    const available_stock = total_stock - lentOut
 
     let dbError
     let finalImageUrl = image_url
@@ -54,7 +68,7 @@ export async function createOrUpdateInventoryItem(formData: FormData) {
     if (id) {
       // Fetch existing tool
       const { data } = await supabaseAdmin
-        .from('tool_catalog')
+        .from('tools')
         .select('*')
         .eq('id', id)
         .single()
@@ -69,7 +83,7 @@ export async function createOrUpdateInventoryItem(formData: FormData) {
             const oldPath = existingItem.image_url.split('/').pop()
             if (oldPath) {
               await supabaseAdmin.storage
-                .from('inventory-photos')
+                .from('inventory')
                 .remove([oldPath])
             }
           } catch (e) {
@@ -80,7 +94,7 @@ export async function createOrUpdateInventoryItem(formData: FormData) {
         const fileExt = imageFile.name.split('.').pop()
         const fileName = `${crypto.randomUUID()}.${fileExt}`
         const { error: uploadErr } = await supabaseAdmin.storage
-          .from('inventory-photos')
+          .from('inventory')
           .upload(fileName, imageFile, {
             contentType: imageFile.type,
             upsert: true
@@ -88,7 +102,7 @@ export async function createOrUpdateInventoryItem(formData: FormData) {
         if (uploadErr) throw uploadErr
 
         const { data: { publicUrl } } = supabaseAdmin.storage
-          .from('inventory-photos')
+          .from('inventory')
           .getPublicUrl(fileName)
         
         finalImageUrl = publicUrl
@@ -96,13 +110,12 @@ export async function createOrUpdateInventoryItem(formData: FormData) {
 
       // Update item parameters
       const { error } = await supabaseAdmin
-        .from('tool_catalog')
+        .from('tools')
         .update({
           name,
           description,
           category,
           serial_number,
-          unit_cost,
           is_serialized,
           status: item_status,
           total_stock,
@@ -118,7 +131,7 @@ export async function createOrUpdateInventoryItem(formData: FormData) {
         const fileExt = imageFile.name.split('.').pop()
         const fileName = `${crypto.randomUUID()}.${fileExt}`
         const { error: uploadErr } = await supabaseAdmin.storage
-          .from('inventory-photos')
+          .from('inventory')
           .upload(fileName, imageFile, {
             contentType: imageFile.type,
             upsert: true
@@ -126,7 +139,7 @@ export async function createOrUpdateInventoryItem(formData: FormData) {
         if (uploadErr) throw uploadErr
 
         const { data: { publicUrl } } = supabaseAdmin.storage
-          .from('inventory-photos')
+          .from('inventory')
           .getPublicUrl(fileName)
         
         finalImageUrl = publicUrl
@@ -134,13 +147,12 @@ export async function createOrUpdateInventoryItem(formData: FormData) {
 
       // Insert new tool
       const { error } = await supabaseAdmin
-        .from('tool_catalog')
+        .from('tools')
         .insert({
           name,
           description,
           category,
           serial_number,
-          unit_cost,
           is_serialized,
           status: item_status,
           total_stock,
@@ -161,20 +173,20 @@ export async function createOrUpdateInventoryItem(formData: FormData) {
 
     revalidatePath('/coordinator/inventory')
     revalidatePath('/hr/inventory')
-    revalidatePath('/accountant/inventory')
     return { success: true }
   } catch (err: any) {
     console.error("Failed to create/update inventory item:", err.message)
-    return { error: "Database transaction failed: " + err.message }
+    return { error: "Failed to save inventory item. Please verify the details and try again." }
   }
 }
 
 // 3. Delete a tool item
 export async function deleteInventoryItem(id: string) {
   try {
+    if (!(await canUseInventory(true))) return { error: NOT_ALLOWED }
     // Check if there are active borrows for this tool
     const { count, error: countErr } = await supabaseAdmin
-      .from('tool_handovers')
+      .from('tool_borrowings')
       .select('*', { count: 'exact', head: true })
       .eq('tool_id', id)
       .eq('status', 'checked_out')
@@ -185,7 +197,7 @@ export async function deleteInventoryItem(id: string) {
     }
 
     const { error } = await supabaseAdmin
-      .from('tool_catalog')
+      .from('tools')
       .delete()
       .eq('id', id)
 
@@ -199,7 +211,6 @@ export async function deleteInventoryItem(id: string) {
 
     revalidatePath('/coordinator/inventory')
     revalidatePath('/hr/inventory')
-    revalidatePath('/accountant/inventory')
     return { success: true }
   } catch (err: any) {
     console.error("Failed to delete inventory item:", err.message)
@@ -210,6 +221,7 @@ export async function deleteInventoryItem(id: string) {
 // 4. Fetch list of active technicians and helpers
 export async function getTechnicians() {
   try {
+    if (!(await canUseInventory())) return []
     const { data, error } = await supabaseAdmin
       .from('profiles')
       .select('id, full_name, role, avatar_url')
@@ -227,11 +239,12 @@ export async function getTechnicians() {
 // 5. Fetch tool assignments (optionally filtered by technician)
 export async function getToolAssignments(technicianId?: string) {
   try {
+    if (!(await canUseInventory())) return []
     let query = supabaseAdmin
-      .from('tool_handovers')
+      .from('tool_borrowings')
       .select(`
         *,
-        tool:tool_catalog!tool_id(name, image_url, category, serial_number),
+        tool:tools!tool_id(name, image_url, category, serial_number),
         technician:profiles!technician_id(full_name, role)
       `)
       .order('handed_over_at', { ascending: false })
@@ -252,13 +265,15 @@ export async function getToolAssignments(technicianId?: string) {
 // 6. Assign/Borrow a tool to a technician
 export async function assignTool(technicianId: string, toolId: string, quantity: number = 1, notes?: string) {
   try {
-    if (isNaN(quantity) || quantity <= 0) {
-      return { error: "Quantity must be greater than 0." }
+    if (!(await canUseInventory(true))) return { error: NOT_ALLOWED }
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      return { error: "Lend a whole number of 1 or more." }
     }
+    if (!technicianId) return { error: "Choose who is borrowing it." }
 
     // Fetch tool to verify available stock level
     const { data: tool, error: toolErr } = await supabaseAdmin
-      .from('tool_catalog')
+      .from('tools')
       .select('name, available_stock')
       .eq('id', toolId)
       .single()
@@ -267,13 +282,30 @@ export async function assignTool(technicianId: string, toolId: string, quantity:
       return { error: "Tool not found in inventory catalog." }
     }
 
-    if (tool.available_stock < quantity) {
-      return { error: `Insufficient stock. Only ${tool.available_stock} available in warehouse.` }
+    const inStock = tool.available_stock ?? 0
+    if (inStock < quantity) {
+      return { error: inStock === 0 ? 'None left in the warehouse.' : `Only ${inStock} in the warehouse.` }
     }
 
-    // Insert borrow checkout assignment
+    // Take the stock first, and only if nobody else changed it since we read it (two people lending at the
+    // same moment can't both take the last ones). Then record the borrowing; if that fails, put the stock back.
+    const { data: taken, error: updateErr } = await supabaseAdmin
+      .from('tools')
+      .update({
+        available_stock: inStock - quantity,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', toolId)
+      .eq('available_stock', inStock)
+      .select('id')
+
+    if (updateErr) throw updateErr
+    if (!taken || taken.length === 0) {
+      return { error: "The stock just changed (someone else lent or returned this tool). Close this window and try again." }
+    }
+
     const { error: insertErr } = await supabaseAdmin
-      .from('tool_handovers')
+      .from('tool_borrowings')
       .insert({
         technician_id: technicianId,
         tool_id: toolId,
@@ -282,18 +314,10 @@ export async function assignTool(technicianId: string, toolId: string, quantity:
         notes: notes?.trim() || null
       })
 
-    if (insertErr) throw insertErr
-
-    // Decrement available quantity in catalog
-    const { error: updateErr } = await supabaseAdmin
-      .from('tool_catalog')
-      .update({
-        available_stock: tool.available_stock - quantity,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', toolId)
-
-    if (updateErr) throw updateErr
+    if (insertErr) {
+      await supabaseAdmin.from('tools').update({ available_stock: inStock }).eq('id', toolId)
+      throw insertErr
+    }
 
     // Fetch technician name
     const { data: tech } = await supabaseAdmin
@@ -311,7 +335,6 @@ export async function assignTool(technicianId: string, toolId: string, quantity:
 
     revalidatePath('/coordinator/inventory')
     revalidatePath('/hr/inventory')
-    revalidatePath('/accountant/inventory')
     return { success: true }
   } catch (err: any) {
     console.error("Failed to assign tool:", err.message)
@@ -325,88 +348,42 @@ export async function returnTool(
   status: 'returned' | 'lost' | 'damaged',
   conditionOnReturn: 'good' | 'minor_wear' | 'damaged' | 'lost' = 'good',
   conditionNotes?: string,
-  damageFee: number = 0,
   receivedBy?: string
 ) {
   try {
-    // Fetch active assignment record
-    const { data: assign, error: assignErr } = await supabaseAdmin
-      .from('tool_handovers')
-      .select('*, tool:tool_catalog!tool_id(name, total_stock, available_stock)')
-      .eq('id', assignmentId)
-      .single()
-
-    if (assignErr || !assign) {
-      return { error: "Handover assignment record not found." }
-    }
-
-    if (assign.status !== 'checked_out') {
-      return { error: "This tool assignment has already been processed/returned." }
-    }
-
-    const handoverQty = assign.quantity || 1
-
-    // Update assignment status and condition audit details
-    const { error: updateAssignErr } = await supabaseAdmin
-      .from('tool_handovers')
-      .update({
-        returned_at: new Date().toISOString(),
-        status,
-        condition_on_return: conditionOnReturn,
-        condition_notes: conditionNotes?.trim() || null,
-        damage_fee: damageFee || 0,
-        received_by: receivedBy || null,
-        notes: conditionNotes?.trim() || assign.notes
-      })
-      .eq('id', assignmentId)
-
-    if (updateAssignErr) throw updateAssignErr
-
-    const tool = assign.tool
-    let nextAvailable = tool.available_stock
-    let nextTotal = tool.total_stock
-
-    if (status === 'returned') {
-      // Returned in usable condition -> put back in warehouse stock
-      nextAvailable = tool.available_stock + handoverQty
-    } else {
-      // Lost or damaged beyond repair:
-      // It does not return to available stock, and it permanently decreases total inventory assets
-      nextTotal = Math.max(0, tool.total_stock - handoverQty)
-    }
-
-    // Update quantities in catalog
-    const { error: updateToolErr } = await supabaseAdmin
-      .from('tool_catalog')
-      .update({
-        total_stock: nextTotal,
-        available_stock: nextAvailable,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', assign.tool_id)
-
-    if (updateToolErr) throw updateToolErr
+    if (!(await canUseInventory(true))) return { error: NOT_ALLOWED }
+    // One step in the database: locks the borrowing, refuses a second check-in, saves it and the stock together
+    const { data, error } = await supabaseAdmin.rpc('check_in_tool', {
+      p_borrowing_id: assignmentId, p_status: status, p_condition: conditionOnReturn,
+      p_notes: conditionNotes, p_received_by: receivedBy,
+    })
+    if (error) throw error
+    const res = data as { status: string; tool_name?: string; technician_id?: string; quantity?: number }
+    if (res.status === 'not_found') return { error: "Handover assignment record not found." }
+    if (res.status === 'already_checked_in') return { error: "This tool assignment has already been processed/returned." }
+    const tool = { name: res.tool_name }
+    const handoverQty = res.quantity ?? 1
+    const assign = { technician_id: res.technician_id }
 
     // Fetch technician name
     const { data: tech } = await supabaseAdmin
       .from('profiles')
       .select('full_name')
-      .eq('id', assign.technician_id)
+      .eq('id', assign.technician_id as string)
       .single()
     const techName = tech?.full_name || 'Technician'
 
     await logActivity({
       category: 'inventory',
       action: status === 'returned' ? 'restocked' : status,
-      description: `Processed return for ${handoverQty}x "${tool.name}" from ${techName} with condition [${conditionOnReturn.toUpperCase()}] and status ${status.toUpperCase()}${damageFee > 0 ? ` (Damage Fee: ₱${damageFee})` : ''}${conditionNotes ? ` (Notes: ${conditionNotes})` : ''}`
+      description: `Processed return for ${handoverQty}x "${tool.name}" from ${techName} with condition [${conditionOnReturn.toUpperCase()}] and status ${status.toUpperCase()}${conditionNotes ? ` (Notes: ${conditionNotes})` : ''}`
     })
 
     revalidatePath('/coordinator/inventory')
     revalidatePath('/hr/inventory')
-    revalidatePath('/accountant/inventory')
     return { success: true }
   } catch (err: any) {
     console.error("Failed to process tool return:", err.message)
-    return { error: "Return transaction failed: " + err.message }
+    return { error: "Failed to process return. Please verify the quantities and try again." }
   }
 }

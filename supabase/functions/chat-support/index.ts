@@ -1,212 +1,174 @@
+// chat-support: the technicians' AI assistant. It searches the company policies (Cloudflare), then writes the answer
+// with Groq, or Cloudflare when Groq is busy. Neither provider trains on or keeps our messages (Gemini's free tier did).
+// Streams to the phone as Server-Sent Events: progress → ready → text … → done (same format the app already reads).
 import "@supabase/functions-js/edge-runtime.d.ts";
-import { GoogleGenerativeAI } from "npm:@google/generative-ai";
+import { createClient } from "npm:@supabase/supabase-js";
+import { CF_BASE, cfHeaders, embed } from "../_shared/cloudflare.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, cache-control, x-requested-with",
 };
 
-export default {
-  async fetch(req: Request) {
-    // Handle CORS preflight
-    if (req.method === "OPTIONS") {
-      return new Response("ok", { headers: corsHeaders });
-    }
+// Tried in order. The Groq secret was saved as "GROQ API KEY" (with spaces); the other spelling is accepted too.
+const WRITERS = [
+  { name: "Groq", url: "https://api.groq.com/openai/v1/chat/completions", model: "openai/gpt-oss-120b",
+    headers: () => ({ Authorization: `Bearer ${Deno.env.get("GROQ API KEY") ?? Deno.env.get("GROQ_API_KEY") ?? ""}`, "Content-Type": "application/json" }),
+    extra: { reasoning_effort: "low" } },
+  { name: "Cloudflare", url: `${CF_BASE}/v1/chat/completions`, model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", headers: cfHeaders, extra: {} },
+];
+const BUSY = "Sorry, I'm a bit busy right now. Please try again in a minute, or ask HR here in this chat. [ACTION:OPEN_TICKET_FORM]";
+const CUT_OFF = "\n\n_(The answer was cut off. Please ask again.)_";
+const NO_SEARCH = "The policy library could not be searched just now. Do not guess company rules: say you couldn't check the company rules right now and suggest asking HR here in this chat.";
+const NO_MATCH = "No matching passage was found in the company policies or manuals.";
 
-    try {
-      const { query, attachment, history } = await req.json();
-      
-      if (!query) {
-        return new Response("Missing query", { status: 400, headers: corsHeaders });
-      }
+const systemPrompt = (contextText: string) => `
+You are Techy, the friendly helper inside the TechnoSys app of Technocycle Corp. (aircon installation and cleaning).
+You talk with field technicians and helpers. You communicate natively in Filipino (Tagalog/Taglish) and English. Reply in the language of the technician's latest message: English question, English answer; Tagalog or Taglish question, Tagalog or Taglish answer.
+You are warm, kind and patient, like a helpful coworker, and you keep answers short.
 
-      const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
-      const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
-      const geminiApiKey = Deno.env.get("GEMINI_API_KEY") ?? "";
-      
-      // In Deno Edge Functions, we instantiate a lightweight Supabase client
-      const { createClient } = await import("npm:@supabase/supabase-js");
-      const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-        global: { headers: { Authorization: req.headers.get("Authorization")! } }
-      });
-
-      const genAI = new GoogleGenerativeAI(geminiApiKey);
-
-      // Create a ReadableStream to stream Server-Sent Events (SSE)
-      const stream = new ReadableStream({
-        async start(controller) {
-          const sendProgress = (msg: string) => {
-            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "progress", message: msg })}\n\n`));
-          };
-
-          try {
-            let contextText = "No relevant documents found. Rely on your general knowledge but mention you couldn't find it in the manual.";
-
-            // STEP 1 & 2: Embed Query & Retrieve Documents (Safe Fallback)
-            try {
-              sendProgress("Understanding your question...");
-              const embeddingModel = genAI.getGenerativeModel({ model: "gemini-embedding-2" });
-              const embedResult = await embeddingModel.embedContent({
-                  content: { role: "user", parts: [{ text: query }]},
-                  outputDimensionality: 768
-              });
-              const queryEmbedding = embedResult.embedding.values;
-
-              sendProgress("Searching technical manuals...");
-              const { data: documents, error } = await supabase.rpc("match_documents", { query_embedding: queryEmbedding, match_threshold: 0.2, match_count: 3 });
-              if (error) { 
-                console.error("RAG RPC Error:", error); 
-              } else if (documents && documents.length > 0) {
-                contextText = documents.map((doc: any) => `[Source: ${doc.document_id}]\n${doc.content}`).join("\n\n");
-                sendProgress("Reading retrieved documents...");
-              }
-            } catch (ragErr) {
-              console.warn("RAG retrieval skipped, using fallback knowledge:", ragErr);
-            }
-
-            const systemPrompt = `
-You are the official TechnoSys Field Support & Operations AI Assistant. 
-You communicate natively in Filipino (Tagalog/Taglish) and English. Always match the language and tone of the technician.
-You are professional, concise, respectful, and direct.
+HOW YOU TALK (very important):
+- Use simple everyday words a technician understands. Never use computer or office-system words: no "database", "backend", "server", "API", "system", "token", "ticket form", "module", "AI model", "document id", "source", "context" or "TechnoSys procedures".
+- Never show codes or file names, such as anything in brackets or with underscores (e.g. "field_ops", "[Source: ...]", "policy v2.0"). Say the policy's plain name instead, e.g. "the safety rules" or "the attendance policy".
+- You are already inside the app, so never say "open the TechnoSys app". The company rules and manuals are in Profile → Handbook.
+- Small talk is welcome: greetings, thanks, "kumusta", "how are you", jokes about the weather, saying goodbye. Answer warmly in one or two friendly sentences as Techy, then offer to help with work things. Never add the form token to small talk.
+- Short answers first; a short list only when there are steps.
 
 STRICT OPERATIONAL DOMAIN & SCOPE GUARDRAILS:
 1. You are strictly an INTERNAL company assistant for TechnoSys employees and technicians.
 2. ALLOWED TOPICS:
    - Technical questions on company tools, equipment, and machinery manuals (Makita drills, Fluke multimeters, Bosch grinders, Hilti rotary hammers, safety gear, troubleshooting, and specifications).
-   - TechnoSys workplace policies, procedures, and admin workflows (Attendance/DTR clocking, disputes, overtime, field scheduling, dispatching, tool accountability, payslips, leaves, safety compliance).
-   - Brief polite greetings (e.g. "Kumusta po! Paano po ako makakatulong sa inyong kagamitan o TechnoSys tasks ngayon?").
+   - TechnoSys workplace policies, procedures, and admin workflows (Attendance/DTR clocking, attendance disputes, overtime, field scheduling, dispatching, tool accountability, leaves, safety compliance).
+   - Greetings, thanks and small talk (hello, hi, kumusta, salamat, how are you, goodbye; typos like "Hello pi" included) and short questions about you (who or what you are, what you can help with). These are NEVER off-topic: answer warmly in one or two sentences (you are Techy; you help with tools, safety, attendance, leave and company rules; HR can read the chat and answer too), then offer help, with no form token (e.g. "Kumusta po! Ako si Techy. May maitutulong ba ako sa trabaho mo ngayon?").
 3. STRICT PROHIBITION ON OFF-TOPIC QUERIES:
-   - If the user asks about ANYTHING outside TechnoSys operations, company manuals, tools, or HR processes (including but not limited to: songs, music lyrics, entertainment, movies, celebrities, random math like "1+1", homework, jokes, personal chit-chat, coding tutorials, politics, or general trivia):
+   - If the user asks about ANYTHING outside TechnoSys operations, company manuals, tools, or HR processes (including but not limited to: songs, music lyrics, entertainment, movies, celebrities, random math like "1+1", homework, coding tutorials, politics, or general trivia):
    - You MUST POLITELY DECLINE. Do NOT answer the off-topic question!
-   - Example Tagalog refusal: "Paumanhin, bilang TechnoSys AI Support Assistant, nakatalaga lamang po ako para sumagot sa mga katanungan patungkol sa kagamitan, safety manuals, attendance/DTR, payslip, scheduling, at mga proseso ng TechnoSys. Paano po kita matutulungan sa inyong mga gawain o kagamitan ngayon?"
-   - Example English refusal: "I apologize, but as the TechnoSys AI Support Assistant, I am strictly designated to assist with company equipment, safety manuals, attendance/DTR, payslips, scheduling, and official TechnoSys procedures. How can I assist you with your TechnoSys tasks today?"
+   - Example Tagalog reply: "Pasensya na, hindi ko 'yan masasagot. Pero tutulungan kita sa trabaho: tools, safety, attendance, leave o mga patakaran ng kumpanya. Ano'ng kailangan mo?"
+   - Example English reply: "Sorry, I can't help with that one. I can help with work things though: tools, safety, your attendance, leave or company rules. What do you need?"
 
 KNOWLEDGE GROUNDING & UNKNOWN INFORMATION:
 - Base technical and procedural answers strictly on the CONTEXT provided below.
 - If the technician asks a legitimate work-related question but the specific details are not found in the CONTEXT:
   - Do NOT invent or hallucinate answers.
   - Politely state that the information is not specified in the current manuals.
-  - Advise them to submit a ticket to the Coordinator or HR Admin using the Support / Ticket form, or report it under the "Others" category so human admin can review it.
+  - Tell them HR can answer: they can keep asking here (HR reads these chats and can reply), or use the app steps below.
   - Output the form trigger: [ACTION:OPEN_TICKET_FORM]
 
-ACTION TRIGGERS:
-- Whenever the user expresses intent to report an issue, dispute a payslip/DTR record, request tool repairs, file a leave, or submit ANY general inquiry/report (including "Others" or when they ask what form to use), guide them briefly, mention they can select the appropriate category (e.g., "Payroll Issue", "Equipment Issue", "DTR Issue", "File Leave", or "Others"), and ALWAYS append this exact token at the very end of your response:
+HELPING WITH REQUESTS (the app's real steps; never invent other form names):
+You cannot file anything yourself, and HR or the Coordinator makes every decision. So when someone wants to do one of these, really help:
+first answer what the policies in the CONTEXT say that matters for it (who approves, deadlines, what proof is needed, how many days), then give the exact steps in the app, short and numbered.
+- Question about a day in their DTR (wrong time, missing time-out, absent mark): DTR tab → tap the day → "Ask HR about this day" → write what's wrong. HR replies in the Inbox.
+- Leave (vacation, sick, emergency): Home → Shortcuts → "Leave" → file a leave: pick the type and dates, add a note, and for sick leave a photo of the medical certificate if the policy asks for one. HR's decision comes as a notification.
+- Overtime: only while timed in on a job. Home → the job card → "Ask for overtime" → say why. Once the Coordinator approves, the extra time counts until they time out.
+- A tool problem (broken, missing parts, lost): Home → Shortcuts → "My tools" → the tool → "Report a problem".
+- Anything else: they can ask HR right here in this chat.
+For these, ALWAYS append this exact token at the very end of your response (the app shows shortcut buttons):
 [ACTION:OPEN_TICKET_FORM]
+Never mention forms called "DTR Dispute", "Overtime Authorization", "Equipment Issue" or "Others": they don't exist in the app.
 
-Format all responses cleanly using Markdown, bold headings, and bullet points.
+Keep the look simple: a few **bold** words and numbered steps when there are steps. No big headings, no tables.
 
 CONTEXT:
 ${contextText}
 `;
 
-            // STEP 3: Sanitize and Build Turn History
-            const userParts: any[] = [{ text: `Question: ${query}` }];
-            if (attachment && attachment.base64) {
-                userParts.push({
-                    inlineData: {
-                        data: attachment.base64,
-                        mimeType: attachment.mimeType || "image/jpeg"
-                    }
-                });
-            }
+type Msg = { role: "system" | "user" | "assistant"; content: string };
 
-            let geminiContents: any[] = [];
-            if (history && Array.isArray(history)) {
-                // Ensure strictly alternating roles (user -> model -> user)
-                // Gemini API rejects conversations starting with 'model'
-                for (const msg of history) {
-                    if (!msg.content || typeof msg.content !== "string") continue;
-                    const currentRole = msg.role === "user" ? "user" : "model";
-                    
-                    if (geminiContents.length === 0 && currentRole === "model") {
-                        // Skip initial assistant greetings so turn 0 is always user
-                        continue;
-                    }
-                    
-                    if (geminiContents.length > 0 && geminiContents[geminiContents.length - 1].role === currentRole) {
-                        geminiContents[geminiContents.length - 1].parts[0].text += "\n\n" + msg.content;
-                    } else {
-                        geminiContents.push({
-                            role: currentRole,
-                            parts: [{ text: msg.content }]
-                        });
-                    }
-                }
-            }
-
-            if (geminiContents.length > 0 && geminiContents[geminiContents.length - 1].role === "user") {
-                geminiContents[geminiContents.length - 1].parts.push(...userParts);
-            } else {
-                geminiContents.push({ role: "user", parts: userParts });
-            }
-
-            // STEP 4: Generate Answer with Failover (gemini-flash-latest -> gemini-flash-lite-latest)
-            sendProgress("Formulating the best answer...");
-            
-            let resultStream: any = null;
-            try {
-                const primaryModel = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-                resultStream = await primaryModel.generateContentStream({
-                    contents: geminiContents,
-                    systemInstruction: { role: "system", parts: [{ text: systemPrompt }] }
-                });
-            } catch (primaryErr: any) {
-                console.warn("Primary model gemini-flash-latest failed, failing over to gemini-flash-lite-latest:", primaryErr.message);
-                try {
-                    const fallbackModel = genAI.getGenerativeModel({ model: "gemini-flash-lite-latest" });
-                    resultStream = await fallbackModel.generateContentStream({
-                        contents: geminiContents,
-                        systemInstruction: { role: "system", parts: [{ text: systemPrompt }] }
-                    });
-                } catch (fallbackErr: any) {
-                    console.error("Both primary and fallback models failed:", fallbackErr.message);
-                    throw fallbackErr;
-                }
-            }
-
-            // Signal that we are transitioning from Progress mode to Text Streaming mode
-            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "ready" })}\n\n`));
-
-            for await (const chunk of resultStream.stream) {
-                const chunkText = chunk.text();
-                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "text", text: chunkText })}\n\n`));
-            }
-
-            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "done" })}\n\n`));
-            controller.close();
-
-          } catch (err: any) {
-            console.error("Generation Error:", err);
-            const fallbackNotice = "I am currently unable to generate a response due to temporary service load. I have flagged this ticket for Admin review so our team can assist you directly.";
-            
-            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "ready" })}\n\n`));
-            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "text", text: fallbackNotice })}\n\n`));
-            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "done" })}\n\n`));
-            controller.close();
-          }
-        }
-      });
-
-      return new Response(stream, {
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive"
-        }
-      });
-
-    } catch (e: any) {
-      return new Response(JSON.stringify({ error: "The AI service is temporarily unavailable. Please try again later." }), { status: 500, headers: corsHeaders });
+/** Reads an OpenAI-style streamed reply and calls onText for each piece. Returns false if nothing was written. */
+async function streamReply(res: Response, onText: (t: string) => void): Promise<boolean> {
+  const reader = res.body!.getReader(), decoder = new TextDecoder();
+  let buffer = "", wrote = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return wrote;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") return wrote;
+      const piece = JSON.parse(data).choices?.[0]?.delta?.content; // reasoning pieces (gpt-oss) are skipped
+      if (piece) { onText(piece); wrote = true; }
     }
   }
+}
+
+export default {
+  async fetch(req: Request) {
+    if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
+
+    try {
+      const { query, history } = await req.json();
+      if (!query) return new Response("Missing query", { status: 400, headers: corsHeaders });
+
+      const supabase = createClient(Deno.env.get("SUPABASE_URL") ?? "", Deno.env.get("SUPABASE_ANON_KEY") ?? "", {
+        global: { headers: { Authorization: req.headers.get("Authorization") ?? "" } },
+      });
+      // Only signed-in employees may use the assistant.
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return new Response(JSON.stringify({ error: "Please sign in again." }), { status: 401, headers: corsHeaders });
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          const send = (obj: unknown) => controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(obj)}\n\n`));
+          let ready = false;
+          const text = (t: string) => { if (!ready) { send({ type: "ready" }); ready = true; } send({ type: "text", text: t }); };
+          try {
+            // 1. Search the policies for the question
+            send({ type: "progress", message: "Understanding your question..." });
+            let contextText = NO_MATCH;
+            try {
+              const [queryEmbedding] = await embed([String(query)]);
+              send({ type: "progress", message: "Searching company policies..." });
+              const { data: documents, error } = await supabase.rpc("match_documents", { query_embedding: queryEmbedding, match_threshold: 0.2, match_count: 3 });
+              if (error) throw error;
+              if (documents?.length) {
+                contextText = documents.map((d: { document_id: string; content: string }) => `[Source: ${d.document_id}]\n${d.content}`).join("\n\n");
+                send({ type: "progress", message: "Reading the matching policies..." });
+              }
+            } catch (searchErr) {
+              console.warn("Policy search failed:", (searchErr as Error).message);
+              contextText = NO_SEARCH;
+            }
+
+            // 2. The conversation: instructions, the last few messages, then the question
+            const messages: Msg[] = [{ role: "system", content: systemPrompt(contextText) }];
+            for (const m of Array.isArray(history) ? history : []) {
+              if (typeof m?.content !== "string" || !m.content) continue;
+              const role = m.role === "user" ? "user" : "assistant";
+              if (messages.length === 1 && role === "assistant") continue; // start with the technician, not the greeting
+              messages.push({ role, content: m.content });
+            }
+            messages.push({ role: "user", content: `Question: ${query}` });
+
+            // 3. Write the answer: Groq, else Cloudflare; never half an answer followed by a false "flagged" note
+            send({ type: "progress", message: "Formulating the best answer..." });
+            let answered = false;
+            for (const w of WRITERS) {
+              try {
+                const res = await fetch(w.url, { method: "POST", headers: w.headers(), body: JSON.stringify({ model: w.model, messages, stream: true, ...w.extra }) });
+                if (!res.ok) { console.warn(`${w.name} refused: ${res.status} ${(await res.text()).slice(0, 200)}`); continue; }
+                answered = await streamReply(res, text);
+                if (answered) break;
+              } catch (writeErr) {
+                console.warn(`${w.name} failed:`, (writeErr as Error).message);
+                if (ready) { text(CUT_OFF); answered = true; break; } // already showing part of an answer: don't start a second one
+              }
+            }
+            if (!answered) text(BUSY);
+          } catch (err) {
+            console.error("chat-support error:", err);
+            text(BUSY);
+          }
+          send({ type: "done" });
+          controller.close();
+        },
+      });
+
+      return new Response(stream, { headers: { ...corsHeaders, "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" } });
+    } catch {
+      return new Response(JSON.stringify({ error: "The AI service is temporarily unavailable. Please try again later." }), { status: 500, headers: corsHeaders });
+    }
+  },
 };
-
-
-
-
-
-
-
-
-

@@ -1,11 +1,13 @@
-import BroadcasterClient from '@/components/dashboard/BroadcasterClient'
+import { AnnouncementsBoard } from '@/components/announcements/AnnouncementsBoard'
+import { getCurrentUser } from '@/lib/current-user'
 
-export default function CEOAnnouncementsPage() {
+export default async function CEOAnnouncementsPage() {
+  const me = await getCurrentUser()
   return (
-    <BroadcasterClient 
-      currentRole="ceo" 
-      adminName="Carlos CEO" 
-      adminRoleLabel="Chief Executive Officer" 
+    <AnnouncementsBoard
+      currentRole="ceo"
+      adminName={me?.name || 'Office'}
+      adminRoleLabel={me?.roleLabel || ''}
     />
   )
 }

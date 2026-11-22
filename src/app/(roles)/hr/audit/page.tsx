@@ -1,5 +1,6 @@
-import AuditLogClient from "@/components/accountant/AuditLogClient";
+// DTR and attendance page.
+import { DtrBoard } from '@/components/dtr/DtrBoard'
 
-export default function HRAuditPage() {
-  return <AuditLogClient />;
+export default function DtrPage() {
+  return <DtrBoard />
 }

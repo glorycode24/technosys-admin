@@ -13,11 +13,12 @@ const cspHeader = `
   base-uri 'self';
   form-action 'self';
   frame-ancestors 'none';
-  connect-src 'self' https://*.supabase.co wss://*.supabase.co https://nominatim.openstreetmap.org;
+  connect-src 'self' ws: wss: https://*.supabase.co wss://*.supabase.co https://nominatim.openstreetmap.org;
   ${isProd ? 'upgrade-insecure-requests;' : ''}
 `.replace(/\s{2,}/g, ' ').trim();
 
 const nextConfig: NextConfig = {
+  allowedDevOrigins: ['127.0.0.1', 'localhost', '127.0.0.1:3000', 'localhost:3000'],
   turbopack: {
     root: path.resolve(__dirname),
   },
@@ -26,15 +27,6 @@ const nextConfig: NextConfig = {
   },
   serverExternalPackages: ['pdf-parse', '@langchain/textsplitters', 'playwright'],
   poweredByHeader: false,
-  async redirects() {
-    return [
-      {
-        source: '/coordinator/dispatch',
-        destination: '/coordinator',
-        permanent: false,
-      },
-    ];
-  },
   async headers() {
     return [
       {
@@ -59,15 +51,6 @@ const nextConfig: NextConfig = {
           {
             key: "Strict-Transport-Security",
             value: "max-age=31536000; includeSubDomains; preload",
-          },
-        ],
-      },
-      {
-        source: "/dashboard/:path*",
-        headers: [
-          {
-            key: "Cache-Control",
-            value: "no-cache, no-store, must-revalidate",
           },
         ],
       },

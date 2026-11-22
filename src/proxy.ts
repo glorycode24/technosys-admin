@@ -40,10 +40,12 @@ export async function proxy(request: NextRequest) {
     pathname.startsWith('/_next') || 
     pathname.startsWith('/favicon.ico') || 
     pathname.startsWith('/api') || 
-    pathname.startsWith('/assets') ||
-    pathname.startsWith('/icons') ||
+    pathname.startsWith('/assets') || 
+    pathname.startsWith('/icons') || 
     pathname.startsWith('/portfolio') ||
     pathname.startsWith('/network-architecture') ||
+    // Public on purpose: the Privacy notice and Terms (Google Play links to them) and the app download page
+    ['/privacy', '/terms', '/download'].includes(pathname) ||
     pathname.endsWith('.png') ||
     pathname.endsWith('.jpg') ||
     pathname.endsWith('.jpeg') ||
@@ -71,8 +73,13 @@ export async function proxy(request: NextRequest) {
       response = NextResponse.redirect(loginUrl);
     } else if (user) {
       // Handle authenticated routing logic
-      if (pathname === '/' || pathname.startsWith('/login')) {
-        const defaultRoute = user.user_metadata?.default_dashboard_route || '/hr';
+      const defaultRoute: string = user.user_metadata?.default_dashboard_route || '/login';
+      const section = pathname.split('/')[1];
+      const isRoleSection = ['ceo', 'hr', 'coordinator', 'technician'].includes(section);
+      // Each role stays inside its own dashboard (/ceo, /hr, /coordinator, /technician).
+      const isOtherRolesSection = isRoleSection && `/${section}` !== defaultRoute;
+
+      if (pathname === '/' || (pathname.startsWith('/login') && defaultRoute !== '/login') || isOtherRolesSection) {
         const url = request.nextUrl.clone();
         url.pathname = defaultRoute;
         response = NextResponse.redirect(url);

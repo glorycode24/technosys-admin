@@ -1,59 +1,52 @@
-'use client'
+// HR overview page: today at a glance, built only from the UI library.
+import { CalendarClock, MessageSquare, ShieldAlert, FolderOpen } from 'lucide-react'
+import { getOverview } from '@/lib/overview'
+import { Page, PageHeader, StatRow, StatTile, ListCard, ListRow, Badge, Avatar } from '@/components/ui'
+import { formatTime, formatDayRange, formatAgo, formatLongDate } from '@/lib/format'
+import { LEAVE_LABELS } from '@/lib/labels'
 
-import { useState } from 'react'
-import { Ticket, CalendarOff } from 'lucide-react'
-import { TicketingTab } from './TicketingTab'
-import { LeavesTab } from './LeavesTab'
+export const dynamic = 'force-dynamic'
 
-export default function TicketsAndLeavesPage() {
-  const [activeTab, setActiveTab] = useState<'tickets' | 'leaves'>('tickets')
+export default async function HrOverviewPage() {
+  const o = await getOverview()
+  const waiting = o.openTickets.filter((t) => t.waiting).length
 
   return (
-    <div className="flex flex-col h-[calc(100vh-64px)] w-full max-w-full">
-      {/* Top Application Bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 gap-3 shrink-0">
-        <div>
-          <div className="flex items-center gap-2">
-            <h1 className="text-xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100">Tickets & Operations</h1>
-            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-800">
-              HR Desk
-            </span>
-          </div>
-          <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">Manage technician disputes, inquiries, and leave workflows.</p>
-        </div>
+    <Page>
+      <PageHeader eyebrow={formatLongDate(o.date)} title="HR overview" subtitle="Requests waiting for you and today's attendance." />
 
-        {/* Segmented Tab Pill */}
-        <div className="inline-flex items-center p-1 bg-zinc-200/70 dark:bg-zinc-800/80 rounded-xl border border-zinc-300/60 dark:border-zinc-700 self-start sm:self-auto shadow-2xs">
-          <button
-            onClick={() => setActiveTab('tickets')}
-            className={`
-              flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all
-              ${activeTab === 'tickets' ? 'bg-white dark:bg-zinc-900 shadow-xs text-blue-600 dark:text-blue-400 font-bold' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'}
-            `}
-          >
-            <Ticket className={`w-3.5 h-3.5 ${activeTab === 'tickets' ? 'text-blue-600 dark:text-blue-400' : 'text-zinc-500 dark:text-zinc-400'}`} />
-            Support & Disputes
-          </button>
-          
-          <button
-            onClick={() => setActiveTab('leaves')}
-            className={`
-              flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all
-              ${activeTab === 'leaves' ? 'bg-white dark:bg-zinc-900 shadow-xs text-blue-600 dark:text-blue-400 font-bold' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'}
-            `}
-          >
-            <CalendarOff className={`w-3.5 h-3.5 ${activeTab === 'leaves' ? 'text-blue-600 dark:text-blue-400' : 'text-zinc-500 dark:text-zinc-400'}`} />
-            Leave Requests
-          </button>
-        </div>
-      </div>
+      <StatRow>
+        <StatTile icon={CalendarClock} label="Leave requests waiting" value={o.pendingLeaves.length} hint={o.pendingOvertime ? `+ ${o.pendingOvertime} overtime request${o.pendingOvertime === 1 ? '' : 's'}` : 'No overtime requests'} tone={o.pendingLeaves.length ? 'warning' : 'success'} href="/hr/leaves" />
+        <StatTile icon={MessageSquare} label="Open tickets" value={o.openTickets.length} hint={waiting ? `${waiting} waiting for your reply` : 'No one waiting for a reply'} tone={waiting ? 'warning' : 'success'} href="/hr/tickets" />
+        <StatTile icon={ShieldAlert} label="Punches to check today" value={o.flaggedPunchesToday} hint={o.flaggedPunchesToday ? 'Outside geofence, fake GPS or unusual' : 'All punches look normal'} tone={o.flaggedPunchesToday ? 'danger' : 'success'} href="/hr/audit" />
+        <StatTile icon={FolderOpen} label="Incomplete 201 files" value={o.incomplete201} hint={`of ${o.fieldStaff} field staff`} tone={o.incomplete201 ? 'warning' : 'success'} href="/hr/files" />
+      </StatRow>
 
-      {/* Tab Content Canvas */}
-      <div className="flex-1 min-h-0 w-full">
-        {activeTab === 'tickets' && <TicketingTab />}
-        {activeTab === 'leaves' && <LeavesTab />}
+      <div className="grid grid-cols-1 gap-section lg:grid-cols-2">
+        <ListCard title="Leave requests waiting" count={o.pendingLeaves.length} href="/hr/leaves" linkLabel="Review" empty="No leave requests to review.">
+          {o.pendingLeaves.slice(0, 3).map((l) => (
+            <ListRow key={l.id} leading={<Avatar name={l.name} />} primary={l.name} secondary={`${LEAVE_LABELS[l.type] || l.type} · ${formatDayRange(l.start, l.end)}`} right={formatAgo(l.filed)} />
+          ))}
+        </ListCard>
+
+        <ListCard title="Open tickets" count={o.openTickets.length} href="/hr/tickets" linkLabel="Answer" empty="No open tickets.">
+          {o.openTickets.slice(0, 3).map((t) => (
+            <ListRow key={t.id} primary={t.title} secondary={t.name} right={formatAgo(t.filed)} badge={<Badge tone={t.status === 'in_progress' ? 'warning' : 'neutral'}>{t.status === 'in_progress' ? 'In progress' : 'New'}</Badge>} />
+          ))}
+        </ListCard>
+
+        <ListCard title="Timed in now" count={o.timedIn.length} href="/hr/audit" linkLabel="Open DTR" empty="No one has timed in yet today.">
+          {o.timedIn.slice(0, 3).map((p) => (
+            <ListRow key={p.id} leading={<Avatar name={p.name} />} primary={p.name} right={`Since ${formatTime(p.since)}`} badge={p.flagged ? <Badge tone="warning">Check punch</Badge> : undefined} />
+          ))}
+        </ListCard>
+
+        <ListCard title="On leave today" count={o.onLeaveToday.length} empty="Everyone is available today.">
+          {o.onLeaveToday.slice(0, 3).map((l) => (
+            <ListRow key={l.id} leading={<Avatar name={l.name} />} primary={l.name} right={LEAVE_LABELS[l.type] || l.type} />
+          ))}
+        </ListCard>
       </div>
-    </div>
+    </Page>
   )
 }
-
