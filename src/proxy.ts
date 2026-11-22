@@ -35,8 +35,6 @@ export async function proxy(request: NextRequest) {
     }
   )
 
-  const { data: { user } } = await supabase.auth.getUser()
-
   // Static assets, images, and public routes skip auth checks
   const isStaticOrPublic = 
     pathname.startsWith('/_next') || 
@@ -45,6 +43,7 @@ export async function proxy(request: NextRequest) {
     pathname.startsWith('/assets') ||
     pathname.startsWith('/icons') ||
     pathname.startsWith('/portfolio') ||
+    pathname.startsWith('/network-architecture') ||
     pathname.endsWith('.png') ||
     pathname.endsWith('.jpg') ||
     pathname.endsWith('.jpeg') ||
@@ -57,17 +56,27 @@ export async function proxy(request: NextRequest) {
 
   if (isStaticOrPublic) {
     // static asset bypass: skip auth checks
-  } else if (!user && !pathname.startsWith('/login')) {
-    // Redirect unauthenticated users to login
-    const loginUrl = new URL('/login', request.url);
-    response = NextResponse.redirect(loginUrl);
-  } else if (user) {
-    // Handle authenticated routing logic
-    if (pathname === '/' || pathname.startsWith('/login')) {
-      const defaultRoute = user.user_metadata?.default_dashboard_route || '/hr';
-      const url = request.nextUrl.clone();
-      url.pathname = defaultRoute;
-      response = NextResponse.redirect(url);
+  } else {
+    let user = null;
+    try {
+      const { data } = await supabase.auth.getUser();
+      user = data?.user ?? null;
+    } catch {
+      user = null;
+    }
+
+    if (!user && !pathname.startsWith('/login')) {
+      // Redirect unauthenticated users to login
+      const loginUrl = new URL('/login', request.url);
+      response = NextResponse.redirect(loginUrl);
+    } else if (user) {
+      // Handle authenticated routing logic
+      if (pathname === '/' || pathname.startsWith('/login')) {
+        const defaultRoute = user.user_metadata?.default_dashboard_route || '/hr';
+        const url = request.nextUrl.clone();
+        url.pathname = defaultRoute;
+        response = NextResponse.redirect(url);
+      }
     }
   }
 
